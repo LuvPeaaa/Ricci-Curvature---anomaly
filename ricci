@@ -1,0 +1,123 @@
+import numpy as np
+import pandas as pd
+import networkx as nx
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.spatial.distance import euclidean
+!pip install GraphRicciCurvature
+from GraphRicciCurvature.OllivierRicci import OllivierRicci
+!pip install faiss-cpu
+import faiss
+import matplotlib.pyplot as plt
+
+def extract_features(data, window_size=20, step=4):
+    features, times = [], []
+    values = data.select_dtypes(include=[np.number]).values
+    for i in range(0, len(values) - window_size + 1, step):
+        window = values[i:i+window_size].flatten()
+        features.append(window)
+        times.append(i)
+    return np.array(features), times
+
+def calculate_distance(x, y, method='euclidean'):
+    if method == 'euclidean':
+        return euclidean(x, y)
+    elif method == 'cosine':
+        return 1 - cosine_similarity([x], [y])[0][0]
+    else:
+        raise ValueError(f"Unsupported distance: {method}")
+
+def build_graph(features, timestamps, method='euclidean', epsilon=0.05):
+    G = nx.Graph()
+    for i, ts in enumerate(timestamps):
+        G.add_node(i, timestamp=ts)
+    for i in range(len(features)):
+        for j in range(i+1, len(features)):
+            d = calculate_distance(features[i], features[j], method)
+            if d < epsilon:
+                G.add_edge(i, j, weight=d)
+    return G
+
+def build_knn_graph(features, timestamps, k=5):
+    features = features.astype('float32')
+    features /= np.linalg.norm(features, axis=1, keepdims=True) + 1e-10
+    index = faiss.IndexFlatIP(features.shape[1])
+    index.add(features)
+    sims, indices = index.search(features, k + 1)
+
+    G = nx.Graph()
+    for i, ts in enumerate(timestamps):
+        G.add_node(i, timestamp=ts)
+    for i in range(len(features)):
+        for pos in range(1, len(indices[i])):
+            j = indices[i][pos]
+            if j < len(features):
+                dist = 1 - sims[i][pos]
+                G.add_edge(i, j, weight=dist)
+    return G
+
+def compute_ricci(G):
+    if G.number_of_edges() == 0:
+        return None
+    if not nx.is_connected(G):
+        G = G.subgraph(max(nx.connected_components(G), key=len)).copy()
+    orc = OllivierRicci(G, alpha=0.5, verbose="ERROR")
+    orc.compute_ricci_curvature()
+    return orc.G
+
+def detect_anomalies(G, threshold=-0.7):
+    anomalies = set()
+    for u, v, d in G.edges(data=True):
+        ricci = d.get('ricciCurvature', 0)
+        if ricci < threshold:
+            anomalies.add(u)
+            anomalies.add(v)
+    return sorted(anomalies)
+
+def analyze(file_path, method='euclidean', window=20, step=4, epsilon=0.05, anomaly_threshold=-0.7):
+    df = pd.read_csv(file_path)
+    df = (df - df.mean(numeric_only=True)) / df.std(numeric_only=True)
+    features, timestamps = extract_features(df, window, step)
+    if method == 'cosine':
+        G = build_knn_graph(features, timestamps, k=5)
+    else:
+        G = build_graph(features, timestamps, method, epsilon)
+    G_ricci = compute_ricci(G)
+    anomalies = detect_anomalies(G_ricci, threshold=anomaly_threshold) if G_ricci else []
+    return G_ricci, anomalies
+
+def plot_graph(G, anomalies=None):
+    if G is None or G.number_of_edges() == 0:
+        print("No graph or no edges to plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    pos = nx.spring_layout(G, seed=42)
+    node_colors = ['red' if n in anomalies else 'lightblue' for n in G.nodes()]
+    nx.draw_networkx_nodes(G, pos, node_size=60, node_color=node_colors, ax=ax)
+    edge_colors = [G[u][v].get('ricciCurvature', 0) for u, v in G.edges()]
+    edges = nx.draw_networkx_edges(
+        G, pos,
+        edge_color=edge_colors,
+        edge_cmap=plt.cm.coolwarm,
+        width=1.5,
+        ax=ax
+    )
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.coolwarm)
+    sm.set_array(edge_colors)
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_label("Ricci Curvature")
+    ax.set_axis_off()
+    ax.set_title("Ricci Curvature on Graph (Anomalies in Red)")
+    plt.show()
+
+
+if __name__ == '__main__':
+    FILE = '/content/drive/MyDrive/Data/processed_stock.csv'
+    for dist in ['euclidean', 'cosine']:
+        print(f"\n--- {dist.upper()} ---")
+        G, anomalies = analyze(FILE, method=dist, epsilon=0.3, anomaly_threshold=-0.7)
+        if G:
+            curvatures = [G[u][v]['ricciCurvature'] for u, v in G.edges()]
+            print(f"Average Ricci: {np.mean(curvatures):.4f}")
+            print(f"Anomalies at timestamps: {anomalies}")
+            plot_graph(G, anomalies)
